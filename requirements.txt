@@ -1,0 +1,5 @@
+aiohttp~=3.8.1
+pyromod~=1.5
+APScheduler~=3.9.1
+beautifulsoup4~=4.8.2
+Pyrogram~=2.0.35
