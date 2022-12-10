@@ -148,9 +148,9 @@ async def download(_, callback_query):
         async with session.get('http://nensaysubs.net/senos/seguro.php') as pic:
             chunk = await pic.content.read()
             with open('photo.png', 'wb') as file:
-                file.write(chunk)
-            os.remove('photo.png')
+                file.write(chunk)            
             await bot.send_photo(callback_query.message.chat.id, 'photo.png')
+            os.remove('photo.png')
             code = await bot.ask(chat_id=callback_query.message.chat.id, text='**Please send the onscreen code**')
             print(code.text)
             await bot.send_message(callback_query.message.chat.id,
