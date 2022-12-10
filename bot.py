@@ -11,7 +11,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 api_id = os.getenv('API_ID') 
 api_hash = os.getenv('API_HASH')
-bot_token = os.getenv('BOT_TOKEN')
+bot_token = '1909716050:AAHSaFsuLzaXOK1OiBhVnqYHsczn7d6udDE'
 bot = Client("bot_session", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 session = ''
 connector = ''
@@ -149,6 +149,7 @@ async def download(_, callback_query):
             chunk = await pic.content.read()
             with open('photo.png', 'wb') as file:
                 file.write(chunk)
+            os.remove('photo.png')
             await bot.send_photo(callback_query.message.chat.id, 'photo.png')
             code = await bot.ask(chat_id=callback_query.message.chat.id, text='**Please send the onscreen code**')
             print(code.text)
@@ -159,6 +160,7 @@ async def download(_, callback_query):
                 with open(f"{zip_name}.zip", 'wb') as file:
                     file.write(chunk)
                 await bot.send_document(callback_query.message.chat.id, f'{zip_name}.zip')
+                os.remove(f'{zip_name}.zip')
                 print("Done!")
 
 
