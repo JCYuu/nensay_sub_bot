@@ -164,6 +164,6 @@ async def download(_, callback_query):
                 print("Done!")
 
 
-scheduler.add_job(login, 'interval', minutes=5, id='login_job', next_run_time=datetime.now())
+scheduler.add_job(login, 'interval', minutes=15, id='login_job', next_run_time=datetime.now())
 scheduler.start()
 bot.run()
