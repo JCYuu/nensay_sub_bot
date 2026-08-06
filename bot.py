@@ -1,169 +1,282 @@
 import asyncio
-import aiohttp
+import ast
+import operator
 import os
-import pyromod.listen
-from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import re
+import tempfile
+from dataclasses import dataclass, field
+from html import escape
+from pathlib import Path
+from urllib.parse import quote, urljoin
+
+import aiohttp
 from aiohttp import ClientSession
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-api_id = os.getenv('API_ID') 
-api_hash = os.getenv('API_HASH')
-bot_token = '1909716050:AAHSaFsuLzaXOK1OiBhVnqYHsczn7d6udDE'
-bot = Client("bot_session", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
-session = ''
-connector = ''
-dic = {}
-is_chapter = False
-id_list = []
+BASE_URL = 'http://nensaysubs.net'
+ASK_TIMEOUT = 300
+RESTART_NOTICE = 'Bot has restarted, please try a new search'
+
+api_id = int(os.environ['API_ID'])
+api_hash = os.environ['API_HASH']
+bot_token = os.environ['BOT_TOKEN']
+bot = Client('bot_session', api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+session = None
 scheduler = AsyncIOScheduler()
 
 
+@dataclass
+class UserState:
+    """Per-user view of the last search. Shared globals would leak between users."""
+    entries: dict = field(default_factory=dict)
+    pages: dict = field(default_factory=dict)
+    counter: int = 0
+
+    def token(self, payload, label):
+        """Store a payload too long for callback_data and return a short handle."""
+        self.counter += 1
+        handle = str(self.counter)
+        self.entries[handle] = (payload, label)
+        return handle
+
+
+states = {}
+
+
+def state_for(user_id):
+    return states.setdefault(user_id, UserState())
+
+
+_CAPTCHA_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def solve_captcha(expression):
+    """Evaluate the arithmetic captcha. Never eval() text scraped off the site."""
+    def _eval(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        if isinstance(node, ast.BinOp) and type(node.op) in _CAPTCHA_OPS:
+            return _CAPTCHA_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        raise ValueError(f'unsupported captcha expression: {expression!r}')
+
+    try:
+        tree = ast.parse(expression.strip(), mode='eval')
+    except SyntaxError as exc:
+        raise ValueError(f'unparseable captcha expression: {expression!r}') from exc
+    return _eval(tree.body)
+
+
+def safe_filename(name, fallback='download'):
+    """Titles come from the site, so they cannot be trusted as path components."""
+    cleaned = re.sub(r'[^\w.\- ]', '_', name).strip(' .')
+    return cleaned[:100] or fallback
+
+
+# --- waiting for a user's reply (replaces pyromod's Client.ask) ---
+
+_pending = {}
+
+
+async def ask(chat_id, user_id, text, timeout=ASK_TIMEOUT):
+    """Send a prompt and wait for that user's next message in that chat."""
+    future = asyncio.get_running_loop().create_future()
+    _pending[(chat_id, user_id)] = future
+    try:
+        await bot.send_message(chat_id, text)
+        return await asyncio.wait_for(future, timeout)
+    finally:
+        _pending.pop((chat_id, user_id), None)
+
+
+@bot.on_message(filters.text & ~filters.command(['start', 'search']), group=-1)
+async def capture_reply(_, message):
+    if message.from_user is None:
+        return
+    future = _pending.get((message.chat.id, message.from_user.id))
+    if future is not None and not future.done():
+        future.set_result(message)
+        message.stop_propagation()
+
+
 async def login():
+    """(Re-)authenticate. One session for the process lifetime, so nothing leaks."""
+    global session
     print('Starting login')
-    global session, connector
-    connector = aiohttp.TCPConnector(force_close=True)
-    session = ClientSession(cookie_jar=aiohttp.CookieJar(), connector=connector)
-    async with session.get("http://nensaysubs.net/") as response:
+    if session is None or session.closed:
+        session = ClientSession(
+            cookie_jar=aiohttp.CookieJar(),
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
+    async with session.get(f'{BASE_URL}/') as response:
         soup = BeautifulSoup(await response.text(), 'html.parser')
-        captcha = eval(soup.find(name='h1', attrs={'class': 'text4'}).text)
-        await asyncio.sleep(1)
-    async with session.post("http://nensaysubs.net/ingreso/index.php/", data={'valor': captcha}) as response:
-        print(response)
+        heading = soup.find(name='h1', attrs={'class': 'text4'})
+        if heading is None:
+            raise RuntimeError('captcha element not found on the landing page')
+        captcha = solve_captcha(heading.text)
+    await asyncio.sleep(1)
+    async with session.post(f'{BASE_URL}/ingreso/index.php/', data={'valor': captcha}) as response:
+        print('Login response:', response.status)
 
 
-async def reload_filter(soup):
+def pagination_buttons(state, soup, view):
+    """'Anterior'/'Siguiente' links, keyed by view so the two lists cannot collide."""
+    rows = []
+    for direction, label in (('prev', 'Anterior'), ('next', 'Siguiente')):
+        link = soup.find(name='a', string=label)
+        if link is None:
+            continue
+        key = f'{view}_{direction}'
+        state.pages[key] = urljoin(BASE_URL, link.get('href'))
+        rows.append([InlineKeyboardButton(text=link.text, callback_data=f'page_{key}')])
+    return rows
+
+
+def reload_filter(state, soup):
     btn_list = []
-    children = soup.find_all(name='td', attrs={'valign': 'top'})
-    filtering = [x.findChildren('a', recursive=True) for x in children]
-    for i, element in enumerate(filtering):
-        title = element[0].text if len(element[0].text) < 61 else element[0].text[:61]
-        btn_list.append([InlineKeyboardButton(text=element[0].text, callback_data=f'a_{title}')])
-        dic[title] = element[0].text
-    print(dic)
-    previous = soup.find(name='a', text='Anterior')
-    next = soup.find(name='a', text='Siguiente')
-    if previous is not None:
-        dic['prev'] = previous.get('href')
-        btn_list.append([InlineKeyboardButton(text=previous.text, callback_data=f'page_prev')])
-    if next is not None:
-        dic['next'] = next.get('href')
-        btn_list.append([InlineKeyboardButton(text=next.text, callback_data=f'page_next')])
+    for children in soup.find_all(name='td', attrs={'valign': 'top'}):
+        anchors = children.find_all('a', recursive=True)
+        if not anchors:
+            continue
+        title = anchors[0].text
+        btn_list.append([InlineKeyboardButton(text=title, callback_data=f'a_{state.token(title, title)}')])
+    btn_list.extend(pagination_buttons(state, soup, 'f'))
     return btn_list
 
 
-async def reload_chapters(soup):
+def reload_chapters(state, soup):
     btn_list = []
     title = ''
     dl = ''
-    i = 0
     for tag in soup.find_all(['span', 'input']):
         if tag.get('id') == 'bloqueados':
             child = tag.find('a', attrs={'id': 'caramelo'})
-            start_pos = child.get('href').find('senos')
-            dl = child.get('href')[start_pos:]
+            if child is not None:
+                start_pos = child.get('href').find('senos')
+                dl = child.get('href')[start_pos:]
         if tag.get('value') == 'Bajar': dl = tag.get('onclick')[13:-3]
         if tag.get('id') == 'animetitu': title = tag.text
         if title != '' and dl != '':
-            if len(title) > 58: title = f'{title[0:51]}...{title[-3:]}'
-            btn_list.append([InlineKeyboardButton(text=title, callback_data=f'l_{dl}')])
-            dic[dl] = title
-            i += 1
+            label = title if len(title) <= 58 else f'{title[0:51]}...{title[-3:]}'
+            btn_list.append([InlineKeyboardButton(text=label, callback_data=f'l_{state.token(dl, title)}')])
             title = dl = ''
-    previous = soup.find(name='a', text='Anterior')
-    next = soup.find(name='a', text='Siguiente')
-    if previous is not None:
-        dic['prevC'] = previous.get('href')
-        btn_list.append([InlineKeyboardButton(text=previous.text, callback_data=f'page_prevC')])
-    if next is not None:
-        dic['nextC'] = next.get('href')
-        btn_list.append([InlineKeyboardButton(text=next.text, callback_data=f'page_nextC')])
+    btn_list.extend(pagination_buttons(state, soup, 'c'))
     return btn_list
 
 
 @bot.on_message(filters.command('start'))
 async def answer(_, message):
-    await bot.send_message(message.chat.id,
-                           f'Hello {message.from_user.username}, to search for an anime use the command /search.')
+    await message.reply_text(
+        f'Hello {message.from_user.first_name}, to search for an anime use the command /search. '
+        f'Do not specify the anime chapter number only the name EXAMPLE /search Bleach.')
 
 
 @bot.on_message(filters.command('search'))
 async def search(_, message):
-    # await login()
-    query = message.text.replace('/search', '').strip()
+    query = ' '.join(message.command[1:]).strip()
     if not query:
-        await bot.send_message(message.chat.id, 'Please add a parameter to /search')
+        await message.reply_text('Please add a parameter to /search')
         return
-    global is_chapter
-    is_chapter = False
-    async with session.post(f"http://nensaysubs.net/buscador/?query={query.replace(' ', '+')}") as response:
+    state = state_for(message.from_user.id)
+    state.entries.clear()
+    async with session.post(f'{BASE_URL}/buscador/', params={'query': query}) as response:
         soup = BeautifulSoup(await response.text(), 'html.parser')
-        btn = await reload_filter(soup)
-        print(btn)
-        if not btn:
-            await bot.send_message(chat_id=message.chat.id,
-                                   text='No results were found for your query, try another one')
-            return
-        await message.reply_text(f"<b> Here is the result for {query}</b>", reply_markup=InlineKeyboardMarkup(btn))
+    btn = reload_filter(state, soup)
+    if not btn:
+        await message.reply_text('No results were found for your query, try another one')
+        return
+    await message.reply_text(f'<b> Here is the result for {escape(query)}</b>',
+                             reply_markup=InlineKeyboardMarkup(btn))
 
 
-@bot.on_callback_query(filters.regex('page_.+'))
+@bot.on_callback_query(filters.regex(r'^page_'))
 async def change_page(_, callback_query):
-    _, page = callback_query.data.split('_')
-    async with session.get(dic[page]) as response:
+    await callback_query.answer()
+    state = state_for(callback_query.from_user.id)
+    key = callback_query.data.split('_', 1)[1]
+    url = state.pages.get(key)
+    if url is None:
+        await callback_query.message.reply_text(RESTART_NOTICE)
+        return
+    async with session.get(url) as response:
         soup = BeautifulSoup(await response.text(), 'html.parser')
-        btn = await reload_chapters(soup) if is_chapter else await reload_filter(soup)
-        await callback_query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(btn))
+    view = key.split('_', 1)[0]
+    btn = reload_chapters(state, soup) if view == 'c' else reload_filter(state, soup)
+    await callback_query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(btn))
 
 
-@bot.on_callback_query(filters.regex('a_.+'))
+@bot.on_callback_query(filters.regex(r'^a_'))
 async def chapters(_, callback_query):
-    _, anime = callback_query.data.split('_')
-    title = dic[anime]
-    print(title)
-    global is_chapter
-    is_chapter = True
-    print(dic)
-    async with session.post(f"http://nensaysubs.net/sub/{title.replace(' ', '_')}") as response:
+    await callback_query.answer()
+    state = state_for(callback_query.from_user.id)
+    entry = state.entries.get(callback_query.data.split('_', 1)[1])
+    if entry is None:
+        await callback_query.message.reply_text(RESTART_NOTICE)
+        return
+    title = entry[0]
+    async with session.post(f"{BASE_URL}/sub/{quote(title.replace(' ', '_'))}") as response:
         soup = BeautifulSoup(await response.text(), 'html.parser')
-        btn = await reload_chapters(soup)
-        await callback_query.edit_message_text(f"<b> Here are {title} subs</b>",
-                                               reply_markup=InlineKeyboardMarkup(btn))
+    btn = reload_chapters(state, soup)
+    await callback_query.edit_message_text(f'<b> Here are {escape(title)} subs</b>',
+                                           reply_markup=InlineKeyboardMarkup(btn))
 
 
-@bot.on_callback_query(filters.regex('l_.+'))
+@bot.on_callback_query(filters.regex(r'^l_'))
 async def download(_, callback_query):
-    _, link = callback_query.data.split("_")
-    zip_name = ''
-    try:
-        zip_name = dic[link]
-    except:
-        await bot.send_message(callback_query.message.chat.id, 'Bot has restarted, please try a new search')
-    dl_link = f'https://nensaysubs.net/{link}'
-    print(dl_link)
-    print(zip_name)
-    async with session.get(dl_link):
-        async with session.get('http://nensaysubs.net/senos/seguro.php') as pic:
-            chunk = await pic.content.read()
-            with open('photo.png', 'wb') as file:
-                file.write(chunk)            
-            await bot.send_photo(callback_query.message.chat.id, 'photo.png')
-            os.remove('photo.png')
-            code = await bot.ask(chat_id=callback_query.message.chat.id, text='**Please send the onscreen code**')
-            print(code.text)
-            await bot.send_message(callback_query.message.chat.id,
-                                   'Sending the zipped file. If file is corrupted then you entered the wrong code')
-            async with session.post('http://nensaysubs.net/solicitud/', data={'code': code.text.lower()}) as dl:
-                chunk = await dl.content.read()
-                with open(f"{zip_name}.zip", 'wb') as file:
-                    file.write(chunk)
-                await bot.send_document(callback_query.message.chat.id, f'{zip_name}.zip')
-                os.remove(f'{zip_name}.zip')
-                print("Done!")
+    await callback_query.answer()
+    chat_id = callback_query.message.chat.id
+    user_id = callback_query.from_user.id
+    state = state_for(user_id)
+    entry = state.entries.get(callback_query.data.split('_', 1)[1])
+    if entry is None:
+        await bot.send_message(chat_id, RESTART_NOTICE)
+        return
+    link, zip_name = entry
+    async with session.get(urljoin(BASE_URL, link)):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            photo_path = Path(tmpdir) / 'captcha.png'
+            async with session.get(f'{BASE_URL}/senos/seguro.php') as pic:
+                photo_path.write_bytes(await pic.read())
+            await bot.send_photo(chat_id, str(photo_path))
+            try:
+                code = await ask(chat_id, user_id, '**Please send the onscreen code**')
+            except asyncio.TimeoutError:
+                await bot.send_message(chat_id, 'Timed out waiting for the code, please try again')
+                return
+            await bot.send_message(
+                chat_id, 'Sending the zipped file. If file is corrupted then you entered the wrong code')
+            zip_path = Path(tmpdir) / f'{safe_filename(zip_name)}.zip'
+            async with session.post(f'{BASE_URL}/solicitud/', data={'code': code.text.strip().lower()}) as dl:
+                zip_path.write_bytes(await dl.read())
+            await bot.send_document(chat_id, str(zip_path))
+            print('Done!')
 
 
-scheduler.add_job(login, 'interval', minutes=5, id='login_job', next_run_time=datetime.now())
-scheduler.start()
-bot.run()
+async def main():
+    await login()
+    scheduler.add_job(login, 'interval', minutes=5, id='login_job')
+    scheduler.start()
+    await bot.start()
+    print('Bot started')
+    await idle()
+    scheduler.shutdown()
+    await bot.stop()
+    if session is not None and not session.closed:
+        await session.close()
+
+
+if __name__ == '__main__':
+    # Must be bot.loop, not asyncio.run(). The @bot.on_* decorators register via
+    # dispatcher.add_handler, which defers the work with client.loop.create_task()
+    # at import time. A fresh loop would never run those tasks and the bot would
+    # start with no handlers at all.
+    bot.loop.run_until_complete(main())
